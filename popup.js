@@ -269,8 +269,8 @@ function getGlobal(blnClear){
 					oRecent[currTab.id].icon = (currTab.favIconUrl) ? currTab.favIconUrl : "icons/defaultFavicon.svg";
 					oRecent[currTab.id].incog = currTab.incognito;
 					oRecent[currTab.id].imgPath = oRecent[currTab.id].icon;
-					oRecent[currTab.id].tabcontext = currTab.cookieStoreId; // v2.2
-					oRecent[currTab.id].tabgroup = currTab.groupId; // v2.6 - requires Fx139+
+					oRecent[currTab.id].tabcontext = currTab.cookieStoreId || null; // v2.2
+					oRecent[currTab.id].tabgroup = (typeof currTab.groupId === 'undefined') ? '-1' : currTab.groupId; // v2.6 - requires Fx139+
 					if (oPrefs.blnIncludePrivate || oRecent[currTab.id].incog === false){
 						addListItem(currTab.id, dest);
 					}
@@ -328,8 +328,8 @@ function getWindow(blnClear){
 							oRecent[currTab.id].icon = (currTab.favIconUrl) ? currTab.favIconUrl : "icons/defaultFavicon.svg";
 							oRecent[currTab.id].incog = currTab.incognito;
 							oRecent[currTab.id].imgPath = oRecent[currTab.id].icon;
-							oRecent[currTab.id].tabcontext = currTab.cookieStoreId; // v2.2
-							oRecent[currTab.id].tabgroup = currTab.groupId; // v2.6 - requires Fx139+
+							oRecent[currTab.id].tabcontext = currTab.cookieStoreId || null; // v2.2
+							oRecent[currTab.id].tabgroup = (typeof currTab.groupId === 'undefined') ? '-1' : currTab.groupId; // v2.6 - requires Fx139+
 							if (oPrefs.blnIncludePrivate || oRecent[currTab.id].incog === false){
 								addListItem(currTab.id, dest);
 							}
@@ -428,17 +428,18 @@ function addListItem(onetab, list){
 	elTemp.insertBefore(document.createTextNode(oRecent[onetab].time), elTemp.firstChild);
 	// v2.2 Store the tab context for the Container Indicator
 	elTemp = clone.querySelector('span[tabcontext]');
-	if (oRecent[onetab].tabcontext == 'firefox-default') elTemp.remove();
+	if (!oRecent[onetab].tabcontext || oRecent[onetab].tabcontext == 'firefox-default') elTemp.remove();
 	else elTemp.setAttribute('tabcontext', oRecent[onetab].tabcontext);
 	// v2.6 Store the group id for the Tab Group Label
 	elTemp = clone.querySelector('span[tabgroup]');
-	if (oRecent[onetab].tabgroup == '-1') elTemp.remove();
+	if (oRecent[onetab].tabgroup == '-1' || oRecent[onetab].tabgroup === undefined) elTemp.remove();
 	else elTemp.setAttribute('tabgroup', oRecent[onetab].tabgroup);
 	// Add the item to the list
 	list.appendChild(clone);
 }
 
 function addContainer(listSelector){
+	if (!browser.contextualIdentities || !browser.contextualIdentities.query) return;
 	var spans = document.querySelectorAll(listSelector + ' span[tabcontext]');
 	browser.contextualIdentities.query({}).then((identities) => {
 		if (!identities.length) return;
@@ -463,6 +464,7 @@ function addContainer(listSelector){
 }
 
 function addGroupLabel(listSelector){ //v2.6
+	if (!browser.tabGroups || !browser.tabGroups.query) return;
 	var spans = document.querySelectorAll(listSelector + ' span[tabgroup]');
 	browser.tabGroups.query({}).then((groups) => {
 		if (!groups.length) return;
