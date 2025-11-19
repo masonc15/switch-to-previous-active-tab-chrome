@@ -1,3 +1,5 @@
+importScripts('browser-polyfill.js');
+
 /* 
   Copyright 2025. Jefferson "jscher2000" Scher. License: MPL-2.0.
   version 0.3 - revise and prepopulate data structure
@@ -33,6 +35,20 @@
   version 2.6 - Tab group labels - now requires Fx139 or higher, option to remove background striping for unloaded tabs
 */
 
+const hasSessionStorage = browser.storage && browser.storage.session;
+const sessionStore = hasSessionStorage ? browser.storage.session : browser.storage.local;
+const actionContexts = ['action'];
+const tabMenuContexts = (browser.contextMenus && browser.contextMenus.ContextType && browser.contextMenus.ContextType.TAB) ? ['tab'] : ['all'];
+let isMac = false;
+
+function prefersDarkMode(){
+	try {
+		return typeof self.matchMedia === 'function' && self.matchMedia('(prefers-color-scheme: dark)').matches;
+	} catch (e){
+		return false;
+	}
+}
+
 /**** Create and populate data structure ****/
 // Default starting values
 var oPrefs = {
@@ -62,19 +78,6 @@ var oPrefs = {
 	extPageSkipTitle: ['Panorama View'],
 	extPageSkipUrl: []
 }
-// Update oPrefs from storage
-browser.storage.local.get("prefs").then((results) => {
-	if (results.prefs != undefined){
-		if (JSON.stringify(results.prefs) != '{}'){
-			var arrSavedPrefs = Object.keys(results.prefs)
-			for (var j=0; j<arrSavedPrefs.length; j++){
-				oPrefs[arrSavedPrefs[j]] = results.prefs[arrSavedPrefs[j]];
-			}
-		}
-	}
-	// version 2.0.2 (this was running asynchronously with default preferences in 2.0.1 and earlier)
-	initObjects();
-}).catch((err) => {console.log('Error retrieving "prefs" from storage: '+err.message);});
 
 // Preferences for RELOAD ALL TABS
 var RATitem = null; // for context menu item
@@ -92,20 +95,98 @@ var oRATprefs = {
 	RATgotoAttn: false			// Automatically go to tabs needing attention
 }
 
-// Update oRATprefs from storage, set up the context menu item
-browser.storage.local.get("RATprefs").then((results) => {
-	if (results.RATprefs != undefined){
-		if (JSON.stringify(results.RATprefs) != '{}'){
-			var arrSavedPrefs = Object.keys(results.RATprefs)
+var oTabs = {};			// store arrays of tabId's in descending order by lastAccessed
+
+async function hydratePrefs(){
+	try {
+		const results = await browser.storage.local.get("prefs");
+		if (results.prefs && JSON.stringify(results.prefs) !== '{}'){
+			var arrSavedPrefs = Object.keys(results.prefs);
+			for (var j=0; j<arrSavedPrefs.length; j++){
+				oPrefs[arrSavedPrefs[j]] = results.prefs[arrSavedPrefs[j]];
+			}
+		}
+	} catch (err){
+		console.log('Error retrieving "prefs" from storage: ' + err.message);
+	}
+}
+
+async function hydrateRATPrefs(){
+	try {
+		const results = await browser.storage.local.get("RATprefs");
+		if (results.RATprefs && JSON.stringify(results.RATprefs) !== '{}'){
+			var arrSavedPrefs = Object.keys(results.RATprefs);
 			for (var j=0; j<arrSavedPrefs.length; j++){
 				oRATprefs[arrSavedPrefs[j]] = results.RATprefs[arrSavedPrefs[j]];
 			}
 		}
+	} catch (err){
+		console.log('Error retrieving "RATprefs" from storage: ' + err.message);
+	}
+}
+
+async function restoreTabsFromSession(){
+	if (!sessionStore || !sessionStore.get) return false;
+	try {
+		const results = await sessionStore.get('tabsSnapshot');
+		if (results.tabsSnapshot && Object.keys(results.tabsSnapshot).length){
+			oTabs = results.tabsSnapshot;
+			return true;
+		}
+	} catch (err){
+		console.log('Error restoring tabs from session storage: ' + err.message);
+	}
+	return false;
+}
+
+function persistTabs(){
+	if (!sessionStore || !sessionStore.set) return;
+	sessionStore.set({tabsSnapshot: oTabs}).catch((err) => {
+		console.log('Error persisting tabs snapshot: ' + err.message);
+	});
+}
+
+async function startup(){
+	browser.runtime.getPlatformInfo().then((info) => {
+		isMac = info.os === 'mac';
+	}).catch(() => {});
+	await Promise.all([hydratePrefs(), hydrateRATPrefs()]);
+	const restored = await restoreTabsFromSession();
+	if (!restored){
+		await initObjects();
+	} else {
+		// Icon/title state may be stale on wake, so trigger an update for the focused window
+		browser.windows.getLastFocused().then((wind) => {
+			setButton(wind.id);
+		}).catch(() => {});
 	}
 	RATmenusetup();
-}).catch((err) => {console.log('Error retrieving "RATprefs" from storage: '+err.message);});
+}
 
-var oTabs = {};			// store arrays of tabId's in descending order by lastAccessed
+async function openActionPopup(tabIndex){
+	oPrefs.popuptab = tabIndex;
+	const popupUrl = browser.runtime.getURL('popup.html');
+	try {
+		await browser.action.setPopup({popup: popupUrl});
+		await browser.action.openPopup();
+	} catch (err){
+		// Fallback for environments where openPopup is blocked (e.g., Chrome overflowed icon)
+		await browser.windows.create({
+			url: popupUrl,
+			type: 'popup',
+			state: 'normal',
+			top: 50,
+			width: 698,
+			height: 588
+		});
+	} finally {
+		try {
+			await browser.action.setPopup({popup: ''});
+		} catch (e){
+			// ignore
+		}
+	}
+}
 
 function initObjects(){
 	// Initialize oTabs object with up to maxTabs recent tabs per window
@@ -114,7 +195,15 @@ function initObjects(){
 	if (oPrefs.blnSkipHidden){
 		params.hidden = false;
 	}
-	browser.tabs.query(params).then((arrAllTabs) => {
+	const tabQuery = browser.tabs.query(params).catch((err) => {
+		// Chrome does not support the hidden query filter
+		if (params.hidden !== undefined){
+			delete params.hidden;
+			return browser.tabs.query(params);
+		}
+		throw err;
+	});
+	return tabQuery.then((arrAllTabs) => {
 		// Sort array of tab objects in descending order by lastAccessed (numeric)
 		arrAllTabs.sort(function(a,b) {return (b.lastAccessed - a.lastAccessed);});
 		// Store tabIds to oTabs
@@ -193,8 +282,12 @@ function initObjects(){
 			// Update toolbar button
 			setButton(arrQTabs[0].windowId);
 		})
+	}).then(() => {
+		persistTabs();
 	});
 }
+
+startup();
 
 /**** Set up tab and window listeners to keep the data fresh ****/
 var blnIsPrivate = false;
@@ -295,6 +388,7 @@ browser.tabs.onActivated.addListener((info) => {
 		}
 		// Update toolbar button
 		setButton(info.windowId);
+		persistTabs();
 	}).catch((err) => {console.log('Promise rejected on tabs.get(): '+err.message);});
 });
 
@@ -338,6 +432,7 @@ browser.tabs.onRemoved.addListener((id, info) => {
 			oTabs['skip'] = arrWTabs;
 		}
 	}
+	persistTabs();
 });
 
 // Listen for tab detach and update oTabs
@@ -387,6 +482,7 @@ browser.tabs.onDetached.addListener((id, info) => {
 		}
 		// Update toolbar button
 		setButton(gotTab.windowId);
+		persistTabs();
 	});
 });
 
@@ -428,6 +524,7 @@ browser.tabs.onAttached.addListener((id, info) => {
 		}
 		// Update toolbar button
 		setButton(info.newWindowId);
+		persistTabs();
 	});
 });
 
@@ -554,8 +651,9 @@ function updateSkipList(tabId, changeInfo, oTab){
 			});
 		}
 	}
+	persistTabs();
 }
-browser.tabs.onUpdated.addListener(updateSkipList, {properties: ["discarded", "hidden"]});
+browser.tabs.onUpdated.addListener(updateSkipList);
 
 // Listen for window close and purge from oTabs
 browser.windows.onRemoved.addListener((wid) => {
@@ -563,6 +661,7 @@ browser.windows.onRemoved.addListener((wid) => {
 	delete oTabs[wid];
 	// Update toolbar button
 	setButton(wid);
+	persistTabs();
 });
 
 // Updates globals and fix toolbar button for current (newly focused) window
@@ -596,6 +695,7 @@ browser.windows.onFocusChanged.addListener((wid) => {
 		} else {
 			// this tab already is top-of-list so no action
 		}
+		persistTabs();
 	}).catch((err) => {console.log('Promise rejected on tabs.query(): '+err.message);});
 });
 
@@ -603,10 +703,11 @@ browser.windows.onFocusChanged.addListener((wid) => {
 /**** Set up toolbar button listener and button/tooltip toggler ****/
 
 // Listen for button click and switch to previous tab
-browser.browserAction.onClicked.addListener((currTab, clickData) => { 
+browser.action.onClicked.addListener((currTab, clickData) => { 
 	// v2.5 uses clickData to check middle button
-	if ((oPrefs.blnButtonSwitches == true && clickData.button == 0) || 
-		(oPrefs.blnButtonSwitches == false && clickData.button == 1 && oPrefs.blnMiddleClick == true)) {
+	var button = (clickData && typeof clickData.button === 'number') ? clickData.button : 0;
+	if ((oPrefs.blnButtonSwitches == true && button == 0) || 
+		(oPrefs.blnButtonSwitches == false && button == 1 && oPrefs.blnMiddleClick == true)) {
 		if (oPrefs.blnSameWindow) {
 			// Within window switch
 			doSwitch(currTab.windowId, currTab.windowId);
@@ -614,19 +715,15 @@ browser.browserAction.onClicked.addListener((currTab, clickData) => {
 			// Unrestricted switch
 			doSwitch('global', currTab.windowId);
 		}
-	} else if (clickData.button == 0 || (clickData.button == 1 && oPrefs.blnMiddleClick == true)) {
+	} else if (button == 0 || (button == 1 && oPrefs.blnMiddleClick == true)) {
 		if (oPrefs.blnSameWindow) {
 			// Current window list
 			oPrefs.popuptab = 0;
-			browser.browserAction.setPopup({popup: browser.runtime.getURL('popup.html')})
-			.then(browser.browserAction.openPopup())
-			.then(browser.browserAction.setPopup({popup: ''}));
+			openActionPopup(0);
 		} else {
 			// Global list
 			oPrefs.popuptab = 1;
-			browser.browserAction.setPopup({popup: browser.runtime.getURL('popup.html')})
-			.then(browser.browserAction.openPopup())
-			.then(browser.browserAction.setPopup({popup: ''}));
+			openActionPopup(1);
 		}		
 	}
 });
@@ -650,57 +747,57 @@ function doSwitch(oKey, wid){
 // Set icon image and tooltip based on ability to switch within current window
 function setButton(wid){
 	if (blnIsPrivate && oPrefs.blnIncludePrivate === false && oPrefs.blnButtonSwitches){
-		browser.browserAction.setIcon({path: 'icons/nolasttab-32.png'});
-		browser.browserAction.setTitle({title: 'No Quick Switch in Private Window'});
+		browser.action.setIcon({path: 'icons/nolasttab-32.png'});
+		browser.action.setTitle({title: 'No Quick Switch in Private Window'});
 		return;
 	}
 	var arrWTabs = oTabs[wid];
 	if (!arrWTabs){
 		// window focused but tab data not available yet; assume the worst
-		browser.browserAction.setIcon({path: 'icons/nolasttab-32.png'});
-		browser.browserAction.setTitle({title: 'Last Accessed Tab Not Available'});			
+		browser.action.setIcon({path: 'icons/nolasttab-32.png'});
+		browser.action.setTitle({title: 'Last Accessed Tab Not Available'});			
 		return;
 	}
 	if (arrWTabs.length > 1 || (oPrefs.blnSameWindow === false && oTabs['global'].length > 1)) {
-		if (oPrefs.blnDark === true || (oPrefs.blnDark === undefined && window.matchMedia('(prefers-color-scheme: dark)').matches)) browser.browserAction.setIcon({path: 'icons/lasttab-32-light.png'});
-		else browser.browserAction.setIcon({path: 'icons/lasttab-32.png'});
-		browser.browserAction.setTitle({title: 'Switch to Last Accessed Tab'}); 
+		if (oPrefs.blnDark === true || (oPrefs.blnDark === undefined && prefersDarkMode())) browser.action.setIcon({path: 'icons/lasttab-32-light.png'});
+		else browser.action.setIcon({path: 'icons/lasttab-32.png'});
+		browser.action.setTitle({title: 'Switch to Last Accessed Tab'}); 
 	} else {
-		browser.browserAction.setIcon({path: 'icons/nolasttab-32.png'});
-		browser.browserAction.setTitle({title: 'Last Accessed Tab Not Available'}); 
+		browser.action.setIcon({path: 'icons/nolasttab-32.png'});
+		browser.action.setTitle({title: 'Last Accessed Tab Not Available'}); 
 	}
 }
 
 /**** Toolbar Button context menu ****/
 
-browser.menus.create({
+browser.contextMenus.create({
   id: "bamenu_switchwindow",
   title: "Go to Last Tab in This Window",
-  contexts: ["browser_action"]
+  contexts: actionContexts
 });
 
-browser.menus.create({
+browser.contextMenus.create({
   id: "bamenu_switchglobal",
   title: "Go to Last Tab Anywhere",
-  contexts: ["browser_action"]
+  contexts: actionContexts
 });
 
-browser.menus.create({
+browser.contextMenus.create({
   id: "bamenu_popup",
   title: "List Recent Tabs",
-  contexts: ["browser_action"]
+  contexts: actionContexts
 });
 
-browser.menus.create({
+browser.contextMenus.create({
   id: "bamenu_options",
   title: "Options",
-  contexts: ["browser_action"]
+  contexts: actionContexts
 });
 
-browser.menus.create({
+browser.contextMenus.create({
   id: "bamenu_reload",
   title: "Reload All Tabs Options",
-  contexts: ["browser_action"]
+  contexts: actionContexts
 });
 
 // Context menu for RELOAD ALL TABS
@@ -718,50 +815,47 @@ function RATmenusetup(){
 		if (oRATprefs.RATbypasscache === true){
 			RATtitle += ' (Bypass Cache)';
 		}
-		RATitem = browser.menus.create({
+		RATitem = browser.contextMenus.create({
 		  id: 'reload_all_tabs_Fx64',
 		  title: RATtitle,
-		  contexts: ["tab"]
+		  contexts: tabMenuContexts
 		});
 	} else if (oRATprefs.RATshowcommand === false && RATitem !== null) {
-		browser.menus.remove('reload_all_tabs_Fx64').catch( (err) => {
+		browser.contextMenus.remove('reload_all_tabs_Fx64').catch( (err) => {
 			console.log('Error removing RAT menu item: ' + err.description) 
 		});
 		RATitem = null;
 	}
 }
 
-browser.menus.onClicked.addListener((menuInfo, currTab) => {
+browser.contextMenus.onClicked.addListener((menuInfo, currTab) => {
+	const mods = Array.isArray(menuInfo.modifiers) ? menuInfo.modifiers : [];
 	switch (menuInfo.menuItemId) {
 		case 'bamenu_switchwindow':
 			// Within window switch
+			if (!currTab) return;
 			doSwitch(currTab.windowId, currTab.windowId);
 			break;
 		case 'bamenu_switchglobal':
 			// Unrestricted switch
+			if (!currTab) return;
 			doSwitch('global', currTab.windowId);
 			break;
 		case 'bamenu_popup':
 			oPrefs.popuptab = 1;
-			browser.browserAction.setPopup({popup: browser.runtime.getURL('popup.html')})
-			.then(browser.browserAction.openPopup())
-			.then(browser.browserAction.setPopup({popup: ''}));
+			openActionPopup(1);
 			break;
 		case 'bamenu_options':
 			oPrefs.popuptab = 2;
-			browser.browserAction.setPopup({popup: browser.runtime.getURL('popup.html')})
-			.then(browser.browserAction.openPopup())
-			.then(browser.browserAction.setPopup({popup: ''}));
+			openActionPopup(2);
 			break;
 		case 'bamenu_reload':
 			oPrefs.popuptab = 3;
-			browser.browserAction.setPopup({popup: browser.runtime.getURL('popup.html')})
-			.then(browser.browserAction.openPopup())
-			.then(browser.browserAction.setPopup({popup: ''}));
+			openActionPopup(3);
 			break;
 		case 'reload_all_tabs_Fx64':
 			// Check modifiers
-			if (menuInfo.modifiers.includes('Ctrl')){
+			if (mods.includes('Ctrl')){
 				// Ctrl+click should call up options 
 				// Use popup window in case browserAction is overflowed or removed
 				oPrefs.popuptab = 3;
@@ -770,11 +864,13 @@ browser.menus.onClicked.addListener((menuInfo, currTab) => {
 					type: 'popup', state: 'normal',
 					top: 50, width: 698, height: 588
 				});
-			} else if (menuInfo.modifiers.includes('Shift')){
+			} else if (mods.includes('Shift')){
 				// Shift+click should bypass cache
+				if (!currTab) return;
 				reloadAll(currTab.id, currTab.windowId, true);
 			} else {
 				// Click should execute with current preferences
+				if (!currTab) return;
 				reloadAll(currTab.id, currTab.windowId, oRATprefs.RATbypasscache);
 			}
 			break;
@@ -785,31 +881,25 @@ browser.menus.onClicked.addListener((menuInfo, currTab) => {
 
 /**** MESSAGING ****/
 
-function handleMessage(request, sender, sendResponse) {
+function ensureTabsReady(){
+	if (oTabs['global'] && oTabs['global'].length) return Promise.resolve();
+	return initObjects();
+}
+
+async function handleMessage(request, sender) {
+	await ensureTabsReady();
 	if ("want" in request) {
 		if (request.want == "global") {
-			sendResponse({
-				glist: oTabs['global']
-			});
-			return true;
+			return {glist: oTabs['global']};
 		} else if (request.want == "skip") {
 			if (!oTabs['skip']){
 				oTabs['skip'] = [];
 			}
-			sendResponse({
-				list: oTabs['skip']
-			});
-			return true;
+			return {list: oTabs['skip']};
 		} else if (request.want == "settings") {
-			sendResponse({
-				response: oPrefs,
-				RAT: oRATprefs
-			})
+			return {response: oPrefs, RAT: oRATprefs};
 		} else {
-			sendResponse({
-				wlist: oTabs[request.want]
-			});
-			return true;
+			return {wlist: oTabs[request.want]};
 		}
 	} else if ("update" in request) {
 		// receive form updates, store to oPrefs, and commit to storage
@@ -840,7 +930,8 @@ function handleMessage(request, sender, sendResponse) {
 		oPrefs.blnActivateDiscarded = oSettings.blnActivateDiscarded;
 		browser.storage.local.set({prefs: oPrefs})
 			.catch((err) => {console.log('Error on browser.storage.local.set(): '+err.message);});
-		if (doReinit) initObjects();
+		if (doReinit) await initObjects();
+		return {ok: true};
 	} else if ("updateRAT" in request) {
 		// receive form updates, store to oRATprefs, and commit to storage
 		var oSettings = request["updateRAT"];
@@ -857,20 +948,27 @@ function handleMessage(request, sender, sendResponse) {
 		browser.storage.local.set({RATprefs: oRATprefs})
 			.catch((err) => {console.log('Error on browser.storage.local.set(): '+err.message);});
 		RATmenusetup();
+		return {ok: true};
 	} else if ("reinit" in request) {
 		if (request.reinit){
-			initObjects();
+			await initObjects();
 		}
+		return {ok: true};
 	} else if ("launchOptions" in request) {
 		oPrefs.popuptab = 2;
-		browser.windows.create({
+		await browser.windows.create({
 			url: browser.runtime.getURL('popup.html'),
 			type: 'popup', state: 'normal',
 			top: 50, width: 698, height: 588
 		});
+		return {ok: true};
 	}
+	return {};
 }
-browser.runtime.onMessage.addListener(handleMessage);
+browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
+	handleMessage(request, sender).then(sendResponse);
+	return true;
+});
 
 /**** RELOAD ALL TABS ****/
 
@@ -928,9 +1026,9 @@ function reloadAll(currentTabId, windId, blnBypass){
 			/*  This doesn't work:
 			oPrefs.popuptab = 3;
 			oRATprefs.asknow = true;
-			browser.browserAction.setPopup({popup: browser.runtime.getURL('popup.html')})
-			.then(browser.browserAction.openPopup())
-			.then(browser.browserAction.setPopup({popup: ''}));
+			browser.action.setPopup({popup: browser.runtime.getURL('popup.html')})
+			.then(browser.action.openPopup())
+			.then(browser.action.setPopup({popup: ''}));
 			*/
 		}
 	})
@@ -1044,19 +1142,9 @@ browser.commands.onCommand.addListener(strName => {
 		})
 	}
 	if (strName === 'show-list'){
-		if (oPrefs.blnSameWindow) {
-			// Current window list
-			oPrefs.popuptab = 0;
-			browser.browserAction.setPopup({popup: browser.runtime.getURL('popup.html')})
-			.then(browser.browserAction.openPopup())
-			.then(browser.browserAction.setPopup({popup: ''}));
-		} else {
-			// Global list
-			oPrefs.popuptab = 1;
-			browser.browserAction.setPopup({popup: browser.runtime.getURL('popup.html')})
-			.then(browser.browserAction.openPopup())
-			.then(browser.browserAction.setPopup({popup: ''}));
-		}
+		// Always open the Global list for this shortcut (mac default: Ctrl+Shift+Down)
+		oPrefs.popuptab = 1;
+		openActionPopup(1);
 	}
 	if (strName.indexOf('activate-tab-') === 0){ // v2.1 Go to Tab by number
 		// Extract requested tab number
