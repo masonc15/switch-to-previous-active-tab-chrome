@@ -39,9 +39,32 @@ const hasSessionStorage = browser.storage && browser.storage.session;
 const sessionStore = hasSessionStorage ? browser.storage.session : browser.storage.local;
 const actionContexts = ['action'];
 const tabMenuContexts = (browser.contextMenus && browser.contextMenus.ContextType && browser.contextMenus.ContextType.TAB) ? ['tab'] : ['all'];
-// Chrome doesn't support 'hidden' query parameter in tabs.query
-const isChrome = typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.id && !navigator.userAgent.includes('Firefox');
 let isMac = false;
+
+// Initialization state - ensures event handlers wait for startup
+let startupPromise = null;
+let isInitialized = false;
+
+// Feature detection for 'hidden' query parameter (Chrome doesn't support it)
+let supportsHiddenQuery = null;
+
+async function detectHiddenQuerySupport() {
+	if (supportsHiddenQuery !== null) return supportsHiddenQuery;
+	try {
+		await browser.tabs.query({ hidden: false, currentWindow: true });
+		supportsHiddenQuery = true;
+	} catch {
+		supportsHiddenQuery = false;
+	}
+	return supportsHiddenQuery;
+}
+
+function ensureInitialized() {
+	if (!startupPromise) {
+		startupPromise = startup();
+	}
+	return startupPromise;
+}
 
 // Check if URL is an extension page (works for both Firefox and Chrome)
 function isExtensionUrl(url){
@@ -154,6 +177,13 @@ function persistTabs(){
 }
 
 async function startup(){
+	// Prevent double-initialization
+	if (isInitialized) return;
+	isInitialized = true;
+
+	// Detect feature support early
+	await detectHiddenQuerySupport();
+
 	browser.runtime.getPlatformInfo().then((info) => {
 		isMac = info.os === 'mac';
 	}).catch(() => {});
@@ -199,8 +229,8 @@ function initObjects(){
 	// Initialize oTabs object with up to maxTabs recent tabs per window
 	oTabs = {}; // flush
 	var params = {};
-	// Chrome doesn't support the hidden query parameter
-	if (oPrefs.blnSkipHidden && !isChrome){
+	// Only use hidden parameter if browser supports it (Firefox does, Chrome doesn't)
+	if (oPrefs.blnSkipHidden && supportsHiddenQuery){
 		params.hidden = false;
 	}
 	const tabQuery = browser.tabs.query(params);
@@ -288,21 +318,22 @@ function initObjects(){
 	});
 }
 
-startup();
+// Start initialization (event handlers will await this via ensureInitialized)
+ensureInitialized();
 
 /**** Set up tab and window listeners to keep the data fresh ****/
 var blnIsPrivate = false;
 
 // Listen for tab activation and update oTabs
 browser.tabs.onActivated.addListener((info) => {
-	browser.tabs.get(info.tabId).then((currTab) => {
-		// Update private window status
-		if (currTab.incognito) blnIsPrivate = true;
-		else blnIsPrivate = false;
-		// Update global tabIds array
-		var arrWTabs = oTabs['global'];
-		if (!arrWTabs) return; // Not initialized yet
-		//   Handle case of tabId in the existing list
+	ensureInitialized().then(() => {
+		browser.tabs.get(info.tabId).then((currTab) => {
+			// Update private window status
+			if (currTab.incognito) blnIsPrivate = true;
+			else blnIsPrivate = false;
+			// Update global tabIds array
+			var arrWTabs = oTabs['global'];
+			//   Handle case of tabId in the existing list
 		var pos = arrWTabs.indexOf(info.tabId);
 		if (pos > 0) { 
 			// remove from its old position
@@ -388,105 +419,110 @@ browser.tabs.onActivated.addListener((info) => {
 				oTabs['skip'] = arrWTabs;
 			}
 		}
-		// Update toolbar button
-		setButton(info.windowId);
-		persistTabs();
-	}).catch((err) => {console.log('Promise rejected on tabs.get(): '+err.message);});
+			// Update toolbar button
+			setButton(info.windowId);
+			persistTabs();
+		}).catch((err) => {console.log('Promise rejected on tabs.get(): '+err.message);});
+	});
 });
 
 // Listen for tab removal and purge from oTabs
 browser.tabs.onRemoved.addListener((id, info) => {
-	// Update global tabIds array
-	var arrWTabs = oTabs['global'];
-	if (!arrWTabs) return; // Not initialized yet
-	//   Handle case of tabId in the existing list
-	var pos = arrWTabs.indexOf(id);
-	if (pos > -1) { 
-		// remove from its old position
-		arrWTabs.splice(pos, 1);
-		// store change
-		oTabs['global'] = arrWTabs;
-	}
-	if (info.isWindowClosing == true){
-		// remove the whole array for this window
-		delete oTabs[info.windowId];
-	} else {
-		// Update window-specific tabIds array
-		var arrWTabs = oTabs[info.windowId];
+	ensureInitialized().then(() => {
+		// Update global tabIds array
+		var arrWTabs = oTabs['global'];
 		//   Handle case of tabId in the existing list
 		var pos = arrWTabs.indexOf(id);
-		if (pos > -1) { 
+		if (pos > -1) {
 			// remove from its old position
 			arrWTabs.splice(pos, 1);
 			// store change
-			oTabs[info.windowId] = arrWTabs;
+			oTabs['global'] = arrWTabs;
 		}
-		// Update toolbar button
-		setButton(info.windowId);
-	}
-	// Remove from skip list if needed (v1.9.5)
-	if (('skip' in oTabs)) {
-		arrWTabs = oTabs['skip'];
-		pos = arrWTabs.indexOf(id);
-		if (pos > -1) { 
-			// remove from its old position
-			arrWTabs.splice(pos, 1);
-			// store change
-			oTabs['skip'] = arrWTabs;
+		if (info.isWindowClosing == true){
+			// remove the whole array for this window
+			delete oTabs[info.windowId];
+		} else {
+			// Update window-specific tabIds array
+			var arrWTabs = oTabs[info.windowId];
+			//   Handle case of tabId in the existing list
+			var pos = arrWTabs.indexOf(id);
+			if (pos > -1) {
+				// remove from its old position
+				arrWTabs.splice(pos, 1);
+				// store change
+				oTabs[info.windowId] = arrWTabs;
+			}
+			// Update toolbar button
+			setButton(info.windowId);
 		}
-	}
-	persistTabs();
+		// Remove from skip list if needed (v1.9.5)
+		if (('skip' in oTabs)) {
+			arrWTabs = oTabs['skip'];
+			pos = arrWTabs.indexOf(id);
+			if (pos > -1) {
+				// remove from its old position
+				arrWTabs.splice(pos, 1);
+				// store change
+				oTabs['skip'] = arrWTabs;
+			}
+		}
+		persistTabs();
+	});
 });
 
 // Listen for tab detach and update oTabs
 browser.tabs.onDetached.addListener((id, info) => {
-	// No update to global tabIds array?
-	// Update window-specific tabIds arrays
-	//  Remove from old
-	var arrWTabs = oTabs[info.oldWindowId];
-	if (!arrWTabs) return; // Not initialized yet
-	var pos = arrWTabs.indexOf(id);
-	if (pos > -1) { 
-		// remove from its old position
-		arrWTabs.splice(pos, 1);
-		// store change
-		oTabs[info.oldWindowId] = arrWTabs;
-	}
-	//  Add to new
-	browser.tabs.get(id).then((gotTab) => {
-		// Update private window status
-		if (gotTab.incognito) blnIsPrivate = true;
-		else blnIsPrivate = false;		
-		// Update window-specific tabIds array
-		var arrWTabs = oTabs[gotTab.windowId];
-		//   Handle case of new window (can't assume)
-		if (!arrWTabs) {
-			oTabs[gotTab.windowId] = [id];
-			arrWTabs = oTabs[gotTab.windowId];
+	ensureInitialized().then(() => {
+		// No update to global tabIds array?
+		// Update window-specific tabIds arrays
+		//  Remove from old
+		var arrWTabs = oTabs[info.oldWindowId];
+		if (arrWTabs) {
+			var pos = arrWTabs.indexOf(id);
+			if (pos > -1) {
+				// remove from its old position
+				arrWTabs.splice(pos, 1);
+				// store change
+				oTabs[info.oldWindowId] = arrWTabs;
+			}
 		}
-		//   Handle case of tabId in the existing list
-		var pos = arrWTabs.indexOf(id);
-		if (pos > 0) { 
-			// remove from its old position
-			arrWTabs.splice(pos, 1);
-			// add to front
-			arrWTabs.unshift(id);
-			// don't check length because we didn't change it
-			// store change
-			oTabs[gotTab.windowId] = arrWTabs;
-		} else if (pos == -1) {
-			// not in list, add to front
-			arrWTabs.unshift(id);
-			// check length and trim off the last if too long
-			if (arrWTabs.length > oPrefs.maxTabs) arrWTabs.pop();
-			// store change
-			oTabs[gotTab.windowId] = arrWTabs;
-		} else {
-			// active tab already is top-of-list so no action
-		}
-		// Update toolbar button
-		setButton(gotTab.windowId);
-		persistTabs();
+		//  Add to new
+		browser.tabs.get(id).then((gotTab) => {
+			// Update private window status
+			if (gotTab.incognito) blnIsPrivate = true;
+			else blnIsPrivate = false;
+			// Update window-specific tabIds array
+			var arrWTabs = oTabs[gotTab.windowId];
+			//   Handle case of new window (can't assume)
+			if (!arrWTabs) {
+				oTabs[gotTab.windowId] = [id];
+				arrWTabs = oTabs[gotTab.windowId];
+			}
+			//   Handle case of tabId in the existing list
+			var pos = arrWTabs.indexOf(id);
+			if (pos > 0) {
+				// remove from its old position
+				arrWTabs.splice(pos, 1);
+				// add to front
+				arrWTabs.unshift(id);
+				// don't check length because we didn't change it
+				// store change
+				oTabs[gotTab.windowId] = arrWTabs;
+			} else if (pos == -1) {
+				// not in list, add to front
+				arrWTabs.unshift(id);
+				// check length and trim off the last if too long
+				if (arrWTabs.length > oPrefs.maxTabs) arrWTabs.pop();
+				// store change
+				oTabs[gotTab.windowId] = arrWTabs;
+			} else {
+				// active tab already is top-of-list so no action
+			}
+			// Update toolbar button
+			setButton(gotTab.windowId);
+			persistTabs();
+		});
 	});
 });
 
@@ -670,38 +706,39 @@ browser.windows.onRemoved.addListener((wid) => {
 
 // Updates globals and fix toolbar button for current (newly focused) window
 browser.windows.onFocusChanged.addListener((wid) => {
-	browser.tabs.query({active:true, windowId: wid}).then((foundtabs) => {
-		if (foundtabs.length < 1) return; // some weird window?
-		// Update private window status
-		if (foundtabs[0].incognito) blnIsPrivate = true;
-		else blnIsPrivate = false;
-		// Update toolbar button
-		setButton(wid);
-		// Update globals
-		var arrWTabs = oTabs['global'];
-		if (!arrWTabs) return; // Not initialized yet
-		// Handle case of tabId in the existing list
-		var pos = arrWTabs.indexOf(foundtabs[0].id);
-		if (pos > 0) { 
-			// remove from its old position
-			arrWTabs.splice(pos, 1);
-			// add to front
-			arrWTabs.unshift(foundtabs[0].id);
-			// don't check length because we didn't change it
-			// store change
-			oTabs['global'] = arrWTabs;
-		} else if (pos == -1) {
-			// not in list, add to front
-			arrWTabs.unshift(foundtabs[0].id);
-			// check length and trim off the last if too long
-			if (arrWTabs.length > oPrefs.maxGlobal) arrWTabs.pop();
-			// store change
-			oTabs['global'] = arrWTabs;
-		} else {
-			// this tab already is top-of-list so no action
-		}
-		persistTabs();
-	}).catch((err) => {console.log('Promise rejected on tabs.query(): '+err.message);});
+	ensureInitialized().then(() => {
+		browser.tabs.query({active:true, windowId: wid}).then((foundtabs) => {
+			if (foundtabs.length < 1) return; // some weird window?
+			// Update private window status
+			if (foundtabs[0].incognito) blnIsPrivate = true;
+			else blnIsPrivate = false;
+			// Update toolbar button
+			setButton(wid);
+			// Update globals
+			var arrWTabs = oTabs['global'];
+			// Handle case of tabId in the existing list
+			var pos = arrWTabs.indexOf(foundtabs[0].id);
+			if (pos > 0) {
+				// remove from its old position
+				arrWTabs.splice(pos, 1);
+				// add to front
+				arrWTabs.unshift(foundtabs[0].id);
+				// don't check length because we didn't change it
+				// store change
+				oTabs['global'] = arrWTabs;
+			} else if (pos == -1) {
+				// not in list, add to front
+				arrWTabs.unshift(foundtabs[0].id);
+				// check length and trim off the last if too long
+				if (arrWTabs.length > oPrefs.maxGlobal) arrWTabs.pop();
+				// store change
+				oTabs['global'] = arrWTabs;
+			} else {
+				// this tab already is top-of-list so no action
+			}
+			persistTabs();
+		}).catch((err) => {console.log('Promise rejected on tabs.query(): '+err.message);});
+	});
 });
 
 
@@ -900,8 +937,7 @@ browser.contextMenus.onClicked.addListener((menuInfo, currTab) => {
 /**** MESSAGING ****/
 
 function ensureTabsReady(){
-	if (oTabs['global'] && oTabs['global'].length) return Promise.resolve();
-	return initObjects();
+	return ensureInitialized();
 }
 
 async function handleMessage(request, sender) {
@@ -1174,8 +1210,8 @@ browser.commands.onCommand.addListener(strName => {
 		if (oPrefs.blnActivatePinned == false){
 			params.pinned = false;
 		}
-		// Chrome doesn't support the hidden query parameter
-		if (oPrefs.blnActivateHidden == false && !isChrome){
+		// Only use hidden parameter if browser supports it
+		if (oPrefs.blnActivateHidden == false && supportsHiddenQuery){
 			params.hidden = false;
 		}
 		if (oPrefs.blnActivateDiscarded == false){
