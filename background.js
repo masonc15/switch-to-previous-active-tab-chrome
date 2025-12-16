@@ -39,7 +39,14 @@ const hasSessionStorage = browser.storage && browser.storage.session;
 const sessionStore = hasSessionStorage ? browser.storage.session : browser.storage.local;
 const actionContexts = ['action'];
 const tabMenuContexts = (browser.contextMenus && browser.contextMenus.ContextType && browser.contextMenus.ContextType.TAB) ? ['tab'] : ['all'];
+// Chrome doesn't support 'hidden' query parameter in tabs.query
+const isChrome = typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.id && !navigator.userAgent.includes('Firefox');
 let isMac = false;
+
+// Check if URL is an extension page (works for both Firefox and Chrome)
+function isExtensionUrl(url){
+	return url && (url.indexOf('moz-extension:') === 0 || url.indexOf('chrome-extension:') === 0);
+}
 
 function prefersDarkMode(){
 	try {
@@ -192,17 +199,11 @@ function initObjects(){
 	// Initialize oTabs object with up to maxTabs recent tabs per window
 	oTabs = {}; // flush
 	var params = {};
-	if (oPrefs.blnSkipHidden){
+	// Chrome doesn't support the hidden query parameter
+	if (oPrefs.blnSkipHidden && !isChrome){
 		params.hidden = false;
 	}
-	const tabQuery = browser.tabs.query(params).catch((err) => {
-		// Chrome does not support the hidden query filter
-		if (params.hidden !== undefined){
-			delete params.hidden;
-			return browser.tabs.query(params);
-		}
-		throw err;
-	});
+	const tabQuery = browser.tabs.query(params);
 	return tabQuery.then((arrAllTabs) => {
 		// Sort array of tab objects in descending order by lastAccessed (numeric)
 		arrAllTabs.sort(function(a,b) {return (b.lastAccessed - a.lastAccessed);});
@@ -231,7 +232,7 @@ function initObjects(){
 				}
 			}
 			// Add extension page to skip list if needed (v1.9.5)
-			if (oPrefs.extPageSkipTitle.includes(arrAllTabs[i].title) && arrAllTabs[i].url.indexOf('moz-extension:') === 0 || 
+			if (oPrefs.extPageSkipTitle.includes(arrAllTabs[i].title) && isExtensionUrl(arrAllTabs[i].url) ||
 				oPrefs.extPageSkipUrl.includes(arrAllTabs[i].url) ) {
 				if (!('skip' in oTabs)) {
 					oTabs['skip'] = [arrAllTabs[i].id];
@@ -300,6 +301,7 @@ browser.tabs.onActivated.addListener((info) => {
 		else blnIsPrivate = false;
 		// Update global tabIds array
 		var arrWTabs = oTabs['global'];
+		if (!arrWTabs) return; // Not initialized yet
 		//   Handle case of tabId in the existing list
 		var pos = arrWTabs.indexOf(info.tabId);
 		if (pos > 0) { 
@@ -362,7 +364,7 @@ browser.tabs.onActivated.addListener((info) => {
 			}
 		}
 		// Add extension page to skip list if needed (v1.9.5)
-		if (oPrefs.extPageSkipTitle.includes(currTab.title) && currTab.url.indexOf('moz-extension:') === 0 || 
+		if (oPrefs.extPageSkipTitle.includes(currTab.title) && isExtensionUrl(currTab.url) ||
 			oPrefs.extPageSkipUrl.includes(currTab.url) ) {
 			if (!('skip' in oTabs)) {
 				oTabs['skip'] = [info.tabId];
@@ -396,6 +398,7 @@ browser.tabs.onActivated.addListener((info) => {
 browser.tabs.onRemoved.addListener((id, info) => {
 	// Update global tabIds array
 	var arrWTabs = oTabs['global'];
+	if (!arrWTabs) return; // Not initialized yet
 	//   Handle case of tabId in the existing list
 	var pos = arrWTabs.indexOf(id);
 	if (pos > -1) { 
@@ -441,6 +444,7 @@ browser.tabs.onDetached.addListener((id, info) => {
 	// Update window-specific tabIds arrays
 	//  Remove from old
 	var arrWTabs = oTabs[info.oldWindowId];
+	if (!arrWTabs) return; // Not initialized yet
 	var pos = arrWTabs.indexOf(id);
 	if (pos > -1) { 
 		// remove from its old position
@@ -543,8 +547,8 @@ function updateSkipList(tabId, changeInfo, oTab){
 				}
 			}
 		} else { // newly restored - remove from list, except skippable extension pages
-			if (('skip' in oTabs) && 
-					!(oPrefs.extPageSkipTitle.includes(oTab.title) && oTab.url.indexOf('moz-extension:') === 0 || 
+			if (('skip' in oTabs) &&
+					!(oPrefs.extPageSkipTitle.includes(oTab.title) && isExtensionUrl(oTab.url) ||
 					oPrefs.extPageSkipUrl.includes(oTab.url))) {
 				arrWTabs = oTabs['skip'];
 				var pos = arrWTabs.indexOf(tabId);
@@ -675,6 +679,7 @@ browser.windows.onFocusChanged.addListener((wid) => {
 		setButton(wid);
 		// Update globals
 		var arrWTabs = oTabs['global'];
+		if (!arrWTabs) return; // Not initialized yet
 		// Handle case of tabId in the existing list
 		var pos = arrWTabs.indexOf(foundtabs[0].id);
 		if (pos > 0) { 
@@ -770,60 +775,73 @@ function setButton(wid){
 
 /**** Toolbar Button context menu ****/
 
-browser.contextMenus.create({
-  id: "bamenu_switchwindow",
-  title: "Go to Last Tab in This Window",
-  contexts: actionContexts
-});
+function createContextMenus(){
+	browser.contextMenus.create({
+	  id: "bamenu_switchwindow",
+	  title: "Go to Last Tab in This Window",
+	  contexts: actionContexts
+	});
 
-browser.contextMenus.create({
-  id: "bamenu_switchglobal",
-  title: "Go to Last Tab Anywhere",
-  contexts: actionContexts
-});
+	browser.contextMenus.create({
+	  id: "bamenu_switchglobal",
+	  title: "Go to Last Tab Anywhere",
+	  contexts: actionContexts
+	});
 
-browser.contextMenus.create({
-  id: "bamenu_popup",
-  title: "List Recent Tabs",
-  contexts: actionContexts
-});
+	browser.contextMenus.create({
+	  id: "bamenu_popup",
+	  title: "List Recent Tabs",
+	  contexts: actionContexts
+	});
 
-browser.contextMenus.create({
-  id: "bamenu_options",
-  title: "Options",
-  contexts: actionContexts
-});
+	browser.contextMenus.create({
+	  id: "bamenu_options",
+	  title: "Options",
+	  contexts: actionContexts
+	});
 
-browser.contextMenus.create({
-  id: "bamenu_reload",
-  title: "Reload All Tabs Options",
-  contexts: actionContexts
+	browser.contextMenus.create({
+	  id: "bamenu_reload",
+	  title: "Reload All Tabs Options",
+	  contexts: actionContexts
+	});
+}
+
+// Create context menus on install/update to avoid duplicates in MV3
+browser.runtime.onInstalled.addListener(() => {
+	createContextMenus();
 });
 
 // Context menu for RELOAD ALL TABS
 function RATmenusetup(){
-	if (oRATprefs.RATshowcommand === true && RATitem === null){
-		if (oRATprefs.RATactive === true){
-			var RATtitle = '🔄 Reload All Tabs';
-		} else {
-			var RATtitle = '🔄 Reload Other Tabs';
-		}
+	var RATtitle = oRATprefs.RATactive === true ? '🔄 Reload All Tabs' : '🔄 Reload Other Tabs';
+	if (oRATprefs.RATpinned === false){
+		RATtitle += ' (Non-Pinned)';
+	}
+	if (oRATprefs.RATbypasscache === true){
+		RATtitle += ' (Bypass Cache)';
+	}
 
-		if (oRATprefs.RATpinned === false){
-			RATtitle += ' (Non-Pinned)';
-		}
-		if (oRATprefs.RATbypasscache === true){
-			RATtitle += ' (Bypass Cache)';
-		}
-		RATitem = browser.contextMenus.create({
-		  id: 'reload_all_tabs_Fx64',
-		  title: RATtitle,
-		  contexts: tabMenuContexts
+	if (oRATprefs.RATshowcommand === true){
+		// Try to update first (works if item exists), then create if needed
+		browser.contextMenus.update('reload_all_tabs_Fx64', { title: RATtitle }).then(() => {
+			RATitem = 'reload_all_tabs_Fx64';
+		}).catch(() => {
+			// Item doesn't exist, create it
+			browser.contextMenus.create({
+			  id: 'reload_all_tabs_Fx64',
+			  title: RATtitle,
+			  contexts: tabMenuContexts
+			}, () => {
+				// Callback required in Chrome to clear runtime.lastError
+				if (browser.runtime.lastError) {
+					// Ignore - item might already exist from race condition
+				}
+				RATitem = 'reload_all_tabs_Fx64';
+			});
 		});
-	} else if (oRATprefs.RATshowcommand === false && RATitem !== null) {
-		browser.contextMenus.remove('reload_all_tabs_Fx64').catch( (err) => {
-			console.log('Error removing RAT menu item: ' + err.description) 
-		});
+	} else if (RATitem !== null) {
+		browser.contextMenus.remove('reload_all_tabs_Fx64').catch(() => {});
 		RATitem = null;
 	}
 }
@@ -1156,7 +1174,8 @@ browser.commands.onCommand.addListener(strName => {
 		if (oPrefs.blnActivatePinned == false){
 			params.pinned = false;
 		}
-		if (oPrefs.blnActivateHidden == false){
+		// Chrome doesn't support the hidden query parameter
+		if (oPrefs.blnActivateHidden == false && !isChrome){
 			params.hidden = false;
 		}
 		if (oPrefs.blnActivateDiscarded == false){
